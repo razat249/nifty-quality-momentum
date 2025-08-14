@@ -4,6 +4,7 @@ import time
 import json
 import datetime as dt
 from typing import List, Dict, Optional, Tuple
+import argparse
 
 import requests
 
@@ -29,6 +30,8 @@ HEADERS = {
 
 COOKIE_HEADER = os.environ.get("NIFTY_COOKIE", "")
 
+_SESSION_WARMED_UP = False
+
 
 def format_nse_date(d: dt.date) -> str:
     return d.strftime("%d-%b-%Y")
@@ -46,13 +49,38 @@ def build_cinfo(start_date: dt.date, end_date: dt.date) -> str:
 
 
 def fetch_year_payload(start_date: dt.date, end_date: dt.date, session: requests.Session) -> str:
+    global _SESSION_WARMED_UP
+    if not _SESSION_WARMED_UP:
+        try:
+            session.get(HEADERS.get("Referer", "https://niftyindices.com/"), headers={
+                k: v for k, v in HEADERS.items() if k not in ("Content-Type",)
+            }, timeout=30)
+        except Exception:
+            pass
+        _SESSION_WARMED_UP = True
+
     payload = {"cinfo": build_cinfo(start_date, end_date)}
     headers = dict(HEADERS)
     if COOKIE_HEADER:
         headers["Cookie"] = COOKIE_HEADER
-    resp = session.post(URL, headers=headers, json=payload, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            resp = session.post(URL, headers=headers, json=payload, timeout=60)
+            if resp.status_code >= 500:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except Exception as e:
+            last_exc = e
+            time.sleep(1.0 * (attempt + 1))
+    else:
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("Failed to fetch after retries")
     html_or_json = data.get("d") if isinstance(data, dict) else None
     if not html_or_json:
         html_or_json = data.get("Data") if isinstance(data, dict) else None
@@ -154,21 +182,31 @@ def write_csv(path: str, headers: List[str], rows: List[Dict[str, str]]) -> None
             writer.writerow(row)
 
 
-def main() -> None:
+def main(
+    user_start_year: Optional[int] = None,
+    user_end_year: Optional[int] = None,
+    only_years: Optional[List[int]] = None,
+    sort_order: str = "desc",
+) -> None:
     workspace_root = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(workspace_root, "data_NIFTY500_MOMENTUM_50")
     ensure_dir(data_dir)
 
     current_year = dt.date.today().year
     today = dt.date.today()
-    start_year = 2005
-    end_year = 2025
+    start_year = 2005 if user_start_year is None else user_start_year
+    end_year = 2025 if user_end_year is None else user_end_year
 
     all_rows: List[Dict[str, str]] = []
     unified_headers: List[str] = []
 
     with requests.Session() as session:
-        for year in range(start_year, end_year + 1):
+        if only_years is not None and len(only_years) > 0:
+            years_to_fetch = sorted(set(only_years))
+        else:
+            years_to_fetch = list(range(start_year, end_year + 1))
+
+        for year in years_to_fetch:
             if year == 2005:
                 start_date = dt.date(2005, 4, 1)
             else:
@@ -222,7 +260,7 @@ def main() -> None:
                     pass
             return (0, 0, 0)
 
-        all_rows.sort(key=lambda r: parse_date_any(r.get(date_key, "")))
+        all_rows.sort(key=lambda r: parse_date_any(r.get(date_key, "")), reverse=(sort_order.lower() == "desc"))
 
     combined_csv = os.path.join(workspace_root, "NIFTY500_MOMENTUM_50_Historical.csv")
     write_csv(combined_csv, unified_headers, all_rows)
@@ -232,6 +270,52 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(
+        description="Download NIFTY500 MOMENTUM 50 yearly historical data"
+    )
+    parser.add_argument(
+        "--year",
+        type=int,
+        help="Download only this year",
+    )
+    parser.add_argument(
+        "--years",
+        type=str,
+        help="Comma-separated list of years to download (e.g. 2018,2020)",
+    )
+    parser.add_argument(
+        "--start-year",
+        type=int,
+        help="First year to download (inclusive)",
+    )
+    parser.add_argument(
+        "--end-year",
+        type=int,
+        help="Last year to download (inclusive)",
+    )
+    parser.add_argument(
+        "--sort",
+        type=str,
+        choices=["asc", "desc"],
+        default="desc",
+        help="Sort order for combined CSV (default: desc)",
+    )
+    args = parser.parse_args()
+
+    if args.years:
+        parts = [p.strip() for p in args.years.split(",") if p.strip()]
+        year_list: List[int] = []
+        for p in parts:
+            try:
+                year_list.append(int(p))
+            except ValueError:
+                raise SystemExit(f"Invalid year in --years: {p}")
+        if not year_list:
+            raise SystemExit("No valid years provided to --years")
+        main(only_years=year_list, sort_order=args.sort)
+    elif args.year is not None:
+        main(args.year, args.year, sort_order=args.sort)
+    else:
+        main(args.start_year, args.end_year, sort_order=args.sort)
 
 

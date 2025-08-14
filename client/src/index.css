@@ -1,0 +1,13 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Optional minimal base tweaks */
+html,
+body,
+#root {
+  height: 100%;
+}
+body {
+  margin: 0;
+}
